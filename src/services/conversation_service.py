@@ -1,8 +1,11 @@
 import uuid
+from datetime import UTC, datetime
 
 from fastapi import HTTPException, UploadFile
+from langgraph.types import Command
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.agents import agent_manager
 from src.repositories.conversation_repository import ConversationRepository
 from src.services.doc_converter import (
     ATTACHMENT_ALLOWED_EXTENSIONS,
@@ -39,6 +42,74 @@ def _make_attachment_path(file_name: str) -> str:
     # 替换路径分隔符
     safe_name = base_name.replace("/", "_").replace("\\", "_")
     return f"/attachments/{safe_name}.md"
+
+
+def _build_state_files(attachments: list[dict]) -> dict:
+    files = {}
+    for attachment in attachments:
+        if attachment.get("status") != "parsed":
+            continue
+
+        file_path = attachment.get("file_path")
+        markdown = attachment.get("markdown")
+        if not file_path or not markdown:
+            continue
+
+        now = datetime.now(UTC).isoformat()
+        files[file_path] = {
+            "content": markdown.split("\n"),
+            "created_at": attachment.get("uploaded_at", now),
+            "modified_at": attachment.get("uploaded_at", now),
+        }
+    return files
+
+
+async def _sync_thread_attachment_state(
+    *,
+    thread_id: str,
+    user_id: str,
+    agent_id: str,
+    attachments: list[dict],
+) -> None:
+    try:
+        agent = agent_manager.get_agent(agent_id)
+        if not agent:
+            logger.warning(f"Skip attachment state sync: agent not found ({agent_id})")
+            return
+
+        graph = await agent.get_graph()
+        config = {"configurable": {"thread_id": thread_id, "user_id": str(user_id)}}
+
+        # 先获取现有 state，保留非附件文件
+        state = await graph.aget_state(config)
+        state_values = getattr(state, "values", {}) if state else {}
+        existing_files = state_values.get("files", {}) if isinstance(state_values, dict) else {}
+        if not isinstance(existing_files, dict):
+            existing_files = {}
+
+        # 仅对 /attachments 命名空间做增量更新，避免覆盖 agent 运行期生成的其它文件。
+        next_attachment_files = _build_state_files(attachments)
+        prev_attachment_paths = {
+            path
+            for path in existing_files.keys()
+            if isinstance(path, str) and path.startswith("/attachments/")
+        }
+        next_attachment_paths = set(next_attachment_files.keys())
+
+        file_updates: dict[str, dict | None] = {**next_attachment_files}
+        for removed_path in prev_attachment_paths - next_attachment_paths:
+            file_updates[removed_path] = None
+
+        # 使用 Command 确保 reducer 被正确应用
+        await graph.aupdate_state(
+            config=config,
+            values={
+                "attachments": attachments,
+                "files": file_updates,
+            },
+        )
+    except Exception as e:
+        logger.warning(f"Failed to sync attachment state for thread {thread_id}: {e}")
 
 
 def serialize_attachment(record: dict) -> dict:
@@ -198,9 +269,16 @@ async def upload_thread_attachment_view(
         "uploaded_at": utc_isoformat(),
         "truncated": conversion.truncated,
         "file_path": file_path,  # 用于 StateBackend，前端不返回此字段
-        "minio_url": minio_url,
+        "minio_url": minio_url,  # 暂未使用
     }
     await conv_repo.add_attachment(conversation.id, attachment_record)
+    all_attachments = await conv_repo.get_attachments(conversation.id)
+    await _sync_thread_attachment_state(
+        thread_id=thread_id,
+        user_id=str(current_user_id),
+        agent_id=conversation.agent_id,
+        attachments=all_attachments,
+    )
 
     return serialize_attachment(attachment_record)
 
@@ -235,4 +313,11 @@ async def delete_thread_attachment_view(
     removed = await conv_repo.remove_attachment(conversation.id, file_id)
     if not removed:
         raise HTTPException(status_code=404, detail="附件不存在或已被删除")
+    all_attachments = await conv_repo.get_attachments(conversation.id)
+    await _sync_thread_attachment_state(
+        thread_id=thread_id,
+        user_id=str(current_user_id),
+        agent_id=conversation.agent_id,
+        attachments=all_attachments,
+    )
     return {"message": "附件已删除"}

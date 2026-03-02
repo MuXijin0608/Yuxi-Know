@@ -1,25 +1,28 @@
 """Deep Agent - 基于create_deep_agent的深度分析智能体"""
 
-from deepagents.backends import StateBackend
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
 from deepagents.middleware.subagents import SubAgentMiddleware
 from langchain.agents import create_agent
 from langchain.agents.middleware import (
     TodoListMiddleware,
+    ToolCallLimitMiddleware,
 )
 
 from src.agents.common import BaseAgent, load_chat_model
+from src.agents.common.backends import create_agent_composite_backend
 from src.agents.common.middlewares import RuntimeConfigMiddleware, SummaryOffloadMiddleware, save_attachments_to_fs
 from src.agents.common.tools import get_tavily_search
 from src.services.mcp_service import get_tools_from_all_servers
+from src.utils import logger
+
 
 from .context import DeepContext
 
 
 def _create_fs_backend(rt):
     """创建文件存储后端"""
-    return StateBackend(rt)
+    return create_agent_composite_backend(rt)
 
 
 def _get_research_sub_agent(search_tools: list) -> dict:
@@ -81,11 +84,14 @@ class DeepAgent(BaseAgent):
         if tavily_search:
             tools.append(tavily_search)
 
-        # Assert that search tool is available for DeepAgent
-        assert tools, (
-            "DeepAgent requires at least one search tool. "
-            "Please configure TAVILY_API_KEY environment variable to enable web search."
-        )
+        # # Assert that search tool is available for DeepAgent
+        # assert tools, (
+        #     "DeepAgent requires at least one search tool. "
+        #     "Please configure TAVILY_API_KEY environment variable to enable web search."
+        # )
+        if not tools:
+            logger.warning("No search tools configured, DeepAgent will work without web search")
+            tools = []
         return tools
 
     async def get_graph(self, **kwargs):
@@ -102,12 +108,22 @@ class DeepAgent(BaseAgent):
         # Build subagents with search tools
         research_sub_agent = _get_research_sub_agent(search_tools)
 
+        # 主 Agent 上下文优化：90k tokens 触发压缩（128k context window 的 70%）
         summary_middleware = SummaryOffloadMiddleware(
             model=model,
-            trigger=("tokens", 160000),
-            trim_tokens_to_summarize=None,
-            summary_offload_threshold=1000,
-            max_retention_ratio=0.6,
+            trigger=("tokens", 90000),
+            trim_tokens_to_summarize=4000,
+            summary_offload_threshold=500,
+            max_retention_ratio=0.5,
+        )
+
+        # 子 Agent 独立的上下文优化：更激进的压缩策略
+        sub_summary_middleware = SummaryOffloadMiddleware(
+            model=sub_model,
+            trigger=("tokens", 50000),
+            trim_tokens_to_summarize=2000,
+            summary_offload_threshold=300,
+            max_retention_ratio=0.4,
         )
 
         subagents_middleware = SubAgentMiddleware(
@@ -122,7 +138,13 @@ class DeepAgent(BaseAgent):
                     enable_tools_override=False,
                 ),
                 PatchToolCallsMiddleware(),
-                summary_middleware,
+                sub_summary_middleware,
+                # 子 Agent 搜索工具限制：tavily_search 最多 8 次
+                ToolCallLimitMiddleware(
+                    tool_name="tavily_search",
+                    run_limit=8,
+                    exit_behavior="continue",
+                ),
             ],
             general_purpose_agent=True,
         )
@@ -139,6 +161,17 @@ class DeepAgent(BaseAgent):
                 PatchToolCallsMiddleware(),
                 subagents_middleware,
                 summary_middleware,
+                # 工具调用限制：tavily_search 总调用最多 20 次
+                ToolCallLimitMiddleware(
+                    tool_name="tavily_search",
+                    thread_limit=20,
+                    exit_behavior="continue",
+                ),
+                # 总工具调用轮次限制：防止单次运行无限循环
+                ToolCallLimitMiddleware(
+                    run_limit=50,
+                    exit_behavior="end",
+                ),
             ],
             checkpointer=await self._get_checkpointer(),
         )

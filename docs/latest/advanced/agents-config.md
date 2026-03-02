@@ -61,6 +61,7 @@ async def get_graph(self, **kwargs):
 | `tools` | list[str] | 启用的内置工具列表 |
 | `knowledges` | list[str] | 关联的知识库列表 |
 | `mcps` | list[str] | 启用的 MCP 服务器名称 |
+| `skills` | list[str] | 关联的 Skills（运行时只读挂载到 `/skills`） |
 
 ```python
 from src.agents.common import BaseContext
@@ -97,6 +98,14 @@ class ReporterContext(BaseContext):
 智能体实例的生命周期交给管理器处理，会在自动发现时完成初始化并缓存单例，以便快速响应请求。在容器内热重载时，只要保存文件即可触发重新导入；需要强制刷新可调用 `agent_manager.get_agent(<id>, reload=True)`。
 
 更多动态工具选择与 MCP 注册的例子，见 `src/agents/chatbot/graph.py` 中的中间件组合。
+
+### Skills 只读挂载
+
+`BaseContext.skills` 用于声明当前智能体可访问的技能目录（slug 列表）。运行时会将这些目录只读挂载到 `/skills/<slug>/...`：
+
+1. 仅显示配置中选中的 skills，未选中的 slug 在运行时不可见。
+2. `/skills` 仅支持读取能力（`ls/read/glob/grep`），写入和编辑会被拒绝。
+3. skills 元数据来自数据库索引，内容目录来自共享存储 `/app/saves/skills`。
 
 ### 拓展现有智能体
 

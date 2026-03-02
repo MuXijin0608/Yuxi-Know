@@ -372,6 +372,7 @@ import ModelSelectorComponent from '@/components/ModelSelectorComponent.vue'
 import { useAgentStore } from '@/stores/agent'
 import { useUserStore } from '@/stores/user'
 import { useDatabaseStore } from '@/stores/database'
+import { skillApi } from '@/apis/skill_api'
 import { storeToRefs } from 'pinia'
 
 // Props
@@ -396,9 +397,17 @@ const databaseStore = useDatabaseStore()
 
 watch(
   () => props.isOpen,
-  (val) => {
+  async (val) => {
     if (val) {
       databaseStore.loadDatabases().catch(() => {})
+      loadLiveSkillOptions().catch(() => {})
+      if (selectedAgentId.value) {
+        try {
+          await agentStore.fetchAgentDetail(selectedAgentId.value, true)
+        } catch (error) {
+          console.error('刷新智能体配置项失败:', error)
+        }
+      }
     }
   }
 )
@@ -423,6 +432,7 @@ const tempSelectedValues = ref([])
 const selectionSearchText = ref('')
 const systemPromptEditMode = ref(false)
 const activeTab = ref('basic')
+const liveSkillOptions = ref([])
 
 const isEmptyConfig = computed(() => {
   return !selectedAgentId.value || Object.keys(configurableItems.value).length === 0
@@ -443,7 +453,8 @@ const hasOtherConfigs = computed(() => {
     const isTools =
       value.template_metadata?.kind === 'mcps' ||
       value.template_metadata?.kind === 'knowledges' ||
-      value.template_metadata?.kind === 'tools'
+      value.template_metadata?.kind === 'tools' ||
+      value.template_metadata?.kind === 'skills'
 
     return !isBasic && !isTools
   })
@@ -462,6 +473,24 @@ const segmentedOptions = computed(() => {
   return options
 })
 
+const loadLiveSkillOptions = async () => {
+  if (!userStore.isAdmin) {
+    liveSkillOptions.value = []
+    return
+  }
+  try {
+    const result = await skillApi.listSkills()
+    const rows = result?.data || []
+    liveSkillOptions.value = rows.map((item) => ({
+      id: item.slug,
+      name: item.slug,
+      description: item.description || ''
+    }))
+  } catch (error) {
+    console.warn('加载实时 Skills 列表失败:', error)
+  }
+}
+
 // 通用选项获取与处理
 const getConfigOptions = (value) => {
   if (value?.template_metadata?.kind === 'tools') {
@@ -470,25 +499,28 @@ const getConfigOptions = (value) => {
   if (value?.template_metadata?.kind === 'knowledges') {
     return databaseStore.databases || []
   }
+  if (value?.template_metadata?.kind === 'skills') {
+    return liveSkillOptions.value.length > 0 ? liveSkillOptions.value : value?.options || []
+  }
   return value?.options || []
 }
 
 const isListConfig = (key, value) => {
   const isTools = value?.template_metadata?.kind === 'tools'
   const isList = value?.type === 'list'
-  return isTools || isList
+  return isTools || isList || key === 'skills'
 }
 
 const getOptionValue = (option) => {
   if (typeof option === 'object' && option !== null) {
-    return option.id || option.value || option.name
+    return option.id || option.value || option.name || option.db_id || option.slug
   }
   return option
 }
 
 const getOptionLabel = (option) => {
   if (typeof option === 'object' && option !== null) {
-    return option.name || option.label || option.id
+    return option.name || option.label || option.id || option.db_id || option.slug
   }
   return option
 }
@@ -523,7 +555,9 @@ const shouldShowConfig = (key, value) => {
   const isTools =
     value.template_metadata?.kind === 'mcps' ||
     value.template_metadata?.kind === 'knowledges' ||
-    value.template_metadata?.kind === 'tools'
+    value.template_metadata?.kind === 'tools' ||
+    value.template_metadata?.kind === 'skills' ||
+    key === 'skills'
 
   if (activeTab.value === 'basic') {
     // 基础：System Prompt, LLM Model
@@ -626,6 +660,9 @@ const openSelectionModal = async (key) => {
       console.error('加载知识库列表失败:', error)
     }
   }
+  if (configurableItems.value[key]?.template_metadata?.kind === 'skills') {
+    await loadLiveSkillOptions()
+  }
   const currentValues = agentConfig.value[key] || []
   tempSelectedValues.value = [...currentValues]
   selectionModalOpen.value = true
@@ -678,29 +715,14 @@ const validateAndFilterConfig = () => {
     const configItem = configItems[key]
     const currentValue = validatedConfig[key]
 
-    // 检查工具配置
-    if (configItem.template_metadata?.kind === 'tools' && Array.isArray(currentValue)) {
-      const availableToolIds = availableTools.value
-        ? Object.values(availableTools.value).map((tool) => tool.id)
-        : []
-      validatedConfig[key] = currentValue.filter((toolId) => availableToolIds.includes(toolId))
+    if (Array.isArray(currentValue) && (configItem.template_metadata?.kind === 'tools' || configItem.type === 'list')) {
+      const options = getConfigOptions(configItem)
+      const validValues = new Set(options.map((opt) => String(getOptionValue(opt))))
+      if (validValues.size === 0) return
 
+      validatedConfig[key] = currentValue.filter((value) => validValues.has(String(value)))
       if (validatedConfig[key].length !== currentValue.length) {
-        console.warn(`工具配置 ${key} 中包含无效的工具ID，已自动过滤`)
-      }
-    }
-
-    // 检查多选配置项 (type === 'list' 且有 options)
-    else if (
-      configItem.type === 'list' &&
-      configItem.options.length > 0 &&
-      Array.isArray(currentValue)
-    ) {
-      const validOptions = configItem.options
-      validatedConfig[key] = currentValue.filter((value) => validOptions.includes(value))
-
-      if (validatedConfig[key].length !== currentValue.length) {
-        console.warn(`配置项 ${key} 中包含无效的选项，已自动过滤`)
+        console.warn(`配置项 ${key} 中包含无效选项，已自动过滤`)
       }
     }
   })

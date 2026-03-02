@@ -91,6 +91,16 @@ class BaseContext:
         },
     )
 
+    skills: Annotated[list[str], {"__template_metadata__": {"kind": "skills"}}] = field(
+        default_factory=list,
+        metadata={
+            "name": "Skills",
+            "options": [],
+            "description": "可选技能列表（由超级管理员维护）。运行时仅挂载并只读暴露选中的 skills。",
+            "type": "list",
+        },
+    )
+
     @classmethod
     def from_file(cls, module_name: str, input_context: dict = None) -> "BaseContext":
         """Load configuration from a YAML file. 用于持久化配置"""

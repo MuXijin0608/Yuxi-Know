@@ -341,6 +341,7 @@ class MCPServer(Base):
     url = Column(String(500), nullable=True, comment="服务器 URL（sse/streamable_http）")
     command = Column(String(500), nullable=True, comment="命令（stdio）")
     args = Column(JSON, nullable=True, comment="命令参数数组（stdio）")
+    env = Column(JSON, nullable=True, comment="环境变量（stdio）")
     headers = Column(JSON, nullable=True, comment="HTTP 请求头")
     timeout = Column(Integer, nullable=True, comment="HTTP 超时时间（秒）")
     sse_read_timeout = Column(Integer, nullable=True, comment="SSE 读取超时（秒）")
@@ -369,6 +370,7 @@ class MCPServer(Base):
             "url": self.url,
             "command": self.command,
             "args": self.args or [],
+            "env": self.env or {},
             "headers": self.headers or {},
             "timeout": self.timeout,
             "sse_read_timeout": self.sse_read_timeout,
@@ -400,6 +402,14 @@ class MCPServer(Base):
             elif isinstance(self.args, str):
                 try:
                     config["args"] = json.loads(self.args)
+                except json.JSONDecodeError:
+                    pass
+        if self.transport == "stdio" and self.env:
+            if isinstance(self.env, dict):
+                config["env"] = self.env
+            elif isinstance(self.env, str):
+                try:
+                    config["env"] = json.loads(self.env)
                 except json.JSONDecodeError:
                     pass
         # headers 只用于 sse/streamable_http 传输类型

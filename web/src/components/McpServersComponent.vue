@@ -214,7 +214,7 @@
         </template>
 
         <!-- StdIO 类型 -->
-        <template v-if="form.transport === 'stdio'">
+        <template v-if="isStdioTransport">
           <a-form-item label="命令" required class="form-item">
             <a-input v-model:value="form.command" placeholder="例如：npx 或 /path/to/server" />
           </a-form-item>
@@ -226,6 +226,10 @@
               placeholder="输入参数后回车添加，如：-m"
               style="width: 100%"
             />
+          </a-form-item>
+
+          <a-form-item label="环境变量" class="form-item">
+            <McpEnvEditor v-model="form.env" />
           </a-form-item>
         </template>
 
@@ -283,6 +287,7 @@ import {
 } from '@ant-design/icons-vue'
 import { mcpApi } from '@/apis/mcp_api'
 import McpServerDetailModal from './McpServerDetailModal.vue'
+import McpEnvEditor from './McpEnvEditor.vue'
 
 // 状态
 const loading = ref(false)
@@ -304,6 +309,7 @@ const form = reactive({
   url: '',
   command: '',
   args: [],
+  env: null,
   headersText: '',
   timeout: null,
   sse_read_timeout: null,
@@ -321,6 +327,10 @@ const httpCount = computed(
 )
 const sseCount = computed(() => servers.value.filter((s) => s.transport === 'sse').length)
 const stdioCount = computed(() => servers.value.filter((s) => s.transport === 'stdio').length)
+const envEditorKey = computed(() => `${form.name}-${form.transport}`)
+const isStdioTransport = computed(
+  () => String(form.transport || '').trim().toLowerCase() === 'stdio'
+)
 
 // 获取服务器列表
 const fetchServers = async () => {
@@ -352,6 +362,7 @@ const showAddModal = () => {
     url: '',
     command: '',
     args: [],
+    env: null,
     headersText: '',
     timeout: null,
     sse_read_timeout: null,
@@ -362,8 +373,7 @@ const showAddModal = () => {
   formModalVisible.value = true
 }
 
-// 显示编辑模态框
-const showEditModal = (server) => {
+const applyServerToForm = (server) => {
   editMode.value = true
   formMode.value = 'form'
   Object.assign(form, {
@@ -373,6 +383,7 @@ const showEditModal = (server) => {
     url: server.url || '',
     command: server.command || '',
     args: server.args || [],
+    env: server.env || null,
     headersText: server.headers ? JSON.stringify(server.headers, null, 2) : '',
     timeout: server.timeout,
     sse_read_timeout: server.sse_read_timeout,
@@ -380,6 +391,20 @@ const showEditModal = (server) => {
     icon: server.icon || ''
   })
   formModalVisible.value = true
+}
+
+// 显示编辑模态框
+const showEditModal = async (server) => {
+  try {
+    const result = await mcpApi.getMcpServer(server.name)
+    if (result.success && result.data) {
+      applyServerToForm(result.data)
+      return
+    }
+  } catch (err) {
+    console.error('获取服务器详情失败，回退使用列表数据:', err)
+  }
+  applyServerToForm(server)
 }
 
 // 显示详情模态框
@@ -420,6 +445,7 @@ const handleFormSubmit = async () => {
         url: form.url || null,
         command: form.command || null,
         args: form.args.length > 0 ? form.args : null,
+        env: form.env,
         headers,
         timeout: form.timeout || null,
         sse_read_timeout: form.sse_read_timeout || null,
@@ -577,6 +603,7 @@ const parseJsonToForm = () => {
       url: obj.url || '',
       command: obj.command || '',
       args: obj.args || [],
+      env: obj.env || null,
       headersText: obj.headers ? JSON.stringify(obj.headers, null, 2) : '',
       timeout: obj.timeout || null,
       sse_read_timeout: obj.sse_read_timeout || null,

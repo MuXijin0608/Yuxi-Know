@@ -1,15 +1,24 @@
 from dataclasses import dataclass, field
 from typing import Annotated
 
+from deepagents.backends import StateBackend
+from deepagents.middleware.filesystem import FilesystemMiddleware
 from langchain.agents import create_agent
 
 from src.agents.common import BaseAgent, BaseContext, load_chat_model
 from src.agents.common.middlewares import (
     RuntimeConfigMiddleware,
+    save_attachments_to_fs,
 )
 from src.agents.common.toolkits.mysql import get_mysql_tools
 from src.services.mcp_service import get_mcp_server_names, get_tools_from_all_servers
 from src.utils import logger
+
+
+def _create_fs_backend(rt):
+    """创建文件存储后端"""
+    return StateBackend(rt)
+
 
 PROMPT = """你的任务是根据用户的指令，使用数据库工具和图表绘制工具，构建 SQL 查询报告。
 你需要根据用户的指令，生成相应的 SQL 查询，并将查询结果以报表的形式返回给用户。
@@ -52,6 +61,10 @@ class SqlReporterAgent(BaseAgent):
         "MySQL 工具默认启用，无法选择，mcp 默认启用 Charts MCPs。"
     )
     context_schema = ReporterContext
+    capabilities = [
+        "file_upload",
+        "files",
+    ]
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -66,7 +79,9 @@ class SqlReporterAgent(BaseAgent):
             system_prompt=context.system_prompt,
             tools=get_mysql_tools(),  # MySQL 工具默认启用，这里添加的 tools，不会在工具选择框中出现
             middleware=[
+                FilesystemMiddleware(backend=_create_fs_backend),  # 文件系统后端
                 RuntimeConfigMiddleware(extra_tools=all_mcp_tools),
+                save_attachments_to_fs,  # 附件保存到文件系统
             ],
             checkpointer=await self._get_checkpointer(),
         )

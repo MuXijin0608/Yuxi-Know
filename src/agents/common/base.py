@@ -12,6 +12,7 @@ from langgraph.graph.state import CompiledStateGraph
 
 from src import config as sys_config
 from src.agents.common.context import BaseContext
+from src.services.skill_resolver import get_skill_options_from_db
 from src.utils import logger
 
 
@@ -43,9 +44,15 @@ class BaseAgent:
         """Get the agent's class name."""
         return self.__class__.__name__
 
-    async def get_info(self):
+    async def get_info(self, include_configurable_items: bool = True):
         # Load metadata from file
         metadata = self.load_metadata()
+        configurable_items = {}
+        if include_configurable_items:
+            configurable_items = self.context_schema.get_configurable_items()
+            if "skills" in configurable_items:
+                configurable_items["skills"] = dict(configurable_items["skills"])
+                configurable_items["skills"]["options"] = await get_skill_options_from_db()
 
         # Merge metadata with class attributes, metadata takes precedence
         return {
@@ -53,7 +60,7 @@ class BaseAgent:
             "name": metadata.get("name", getattr(self, "name", "Unknown")),
             "description": metadata.get("description", getattr(self, "description", "Unknown")),
             "examples": metadata.get("examples", []),
-            "configurable_items": self.context_schema.get_configurable_items(),
+            "configurable_items": configurable_items,
             "has_checkpointer": await self.check_checkpointer(),
             "capabilities": getattr(self, "capabilities", []),  # 智能体能力列表
         }
@@ -168,18 +175,52 @@ class BaseAgent:
         if self.checkpointer is not None:
             return self.checkpointer
 
-        # 创建数据库连接并确保设置 checkpointer
         checkpointer = None
+        backend = os.getenv("LANGGRAPH_CHECKPOINTER_BACKEND", "sqlite").strip().lower()
 
-        try:
-            checkpointer = AsyncSqliteSaver(await self.get_async_conn())
+        if backend == "postgres":
+            checkpointer = await self._create_postgres_checkpointer()
 
-        except Exception as e:
-            logger.error(f"构建 Graph 设置 checkpointer 时出错: {e}, 尝试使用内存存储")
-            checkpointer = InMemorySaver()
+        if checkpointer is None:
+            try:
+                checkpointer = AsyncSqliteSaver(await self.get_async_conn())
+            except Exception as e:
+                logger.error(f"构建 sqlite checkpointer 失败: {e}, 尝试使用内存存储")
+                checkpointer = InMemorySaver()
 
         self.checkpointer = checkpointer
         return self.checkpointer
+
+    async def _create_postgres_checkpointer(self):
+        postgres_url = os.getenv("POSTGRES_URL")
+        if not postgres_url:
+            logger.warning("POSTGRES_URL 未配置，无法启用 postgres checkpointer，回退 sqlite")
+            return None
+
+        try:
+            from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver  # type: ignore
+        except Exception as e:
+            logger.warning(f"langgraph postgres checkpointer 不可用，回退 sqlite: {e}")
+            return None
+
+        conn_str = postgres_url.replace("+asyncpg", "")
+        try:
+            saver_factory = getattr(AsyncPostgresSaver, "from_conn_string", None)
+            if callable(saver_factory):
+                saver = saver_factory(conn_str)
+            else:
+                saver = AsyncPostgresSaver(conn_str)  # type: ignore[call-arg]
+
+            setup_fn = getattr(saver, "setup", None)
+            if callable(setup_fn):
+                result = setup_fn()
+                if hasattr(result, "__await__"):
+                    await result
+            logger.info(f"{self.name} 使用 postgres checkpointer")
+            return saver
+        except Exception as e:
+            logger.warning(f"初始化 postgres checkpointer 失败，回退 sqlite: {e}")
+            return None
 
     async def get_async_conn(self) -> aiosqlite.Connection:
         """获取异步数据库连接"""

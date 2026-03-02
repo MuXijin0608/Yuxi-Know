@@ -488,17 +488,24 @@ class UploadGraphService:
             logger.error(f"加载图数据库信息失败：{e}")
             return False
 
-    async def aget_embedding(self, text, batch_size=40):
+    def _resolve_embedding_batch_size(self, batch_size=None):
+        if batch_size is not None:
+            return batch_size
+        return int(getattr(self.embed_model, "batch_size", 40) or 40)
+
+    async def aget_embedding(self, text, batch_size=None):
         if isinstance(text, list):
-            outputs = await self.embed_model.abatch_encode(text, batch_size=batch_size)
+            resolved_batch_size = self._resolve_embedding_batch_size(batch_size)
+            outputs = await self.embed_model.abatch_encode(text, batch_size=resolved_batch_size)
             return outputs
         else:
             outputs = await self.embed_model.aencode(text)
             return outputs
 
-    def get_embedding(self, text, batch_size=40):
+    def get_embedding(self, text, batch_size=None):
         if isinstance(text, list):
-            outputs = self.embed_model.batch_encode(text, batch_size=batch_size)
+            resolved_batch_size = self._resolve_embedding_batch_size(batch_size)
+            outputs = self.embed_model.batch_encode(text, batch_size=resolved_batch_size)
             return outputs
         else:
             outputs = self.embed_model.encode([text])[0]

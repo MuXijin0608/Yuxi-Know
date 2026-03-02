@@ -78,6 +78,10 @@
                     </a-tag>
                   </span>
                 </div>
+                <div class="info-item" v-if="server.env && Object.keys(server.env).length > 0">
+                  <label>环境变量</label>
+                  <pre class="headers-pre">{{ JSON.stringify(server.env, null, 2) }}</pre>
+                </div>
               </template>
 
               <div class="info-item" v-if="server.description">
