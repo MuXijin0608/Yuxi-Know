@@ -179,7 +179,6 @@ class CommonKnowledgeRetriever(KnowledgeRetrieverModel):
     file_name: str = Field(description="限定文件名称，当操作类型为 'search' 时，可以指定文件名称，支持模糊匹配")
 
 
-
 class HybridRagSearchInput(BaseModel):
     query_text: str = Field(description="检索关键词")
     db_names: list[str] | None = Field(default=None, description="限定知识库名称列表，为空时检索全部知识库")
@@ -467,11 +466,7 @@ async def _run_system_rag_search(
 
     if db_names:
         target_names = {name.strip() for name in db_names if name and name.strip()}
-        selected_items = [
-            (db_id, info)
-            for db_id, info in retrievers.items()
-            if info.get("name") in target_names
-        ]
+        selected_items = [(db_id, info) for db_id, info in retrievers.items() if info.get("name") in target_names]
     else:
         selected_items = list(retrievers.items())
 
@@ -649,9 +644,7 @@ async def agentic_rag_search(
             )
         )
     if "system" in engines:
-        tasks["system"] = asyncio.create_task(
-            _run_system_rag_search(query_text=query_text, db_names=system_db_names)
-        )
+        tasks["system"] = asyncio.create_task(_run_system_rag_search(query_text=query_text, db_names=system_db_names))
 
     engine_results: dict[str, Any] = {"bm25": None, "simkgc": None, "system": None}
     for name, task in tasks.items():
@@ -669,6 +662,7 @@ async def agentic_rag_search(
         "simkgc": engine_results["simkgc"],
         "system": engine_results["system"],
     }
+
 
 def get_kb_based_tools(db_names: list[str] | None = None) -> list:
     """获取所有知识库基于的工具"""

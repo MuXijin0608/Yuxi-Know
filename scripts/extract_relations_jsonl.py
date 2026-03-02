@@ -48,9 +48,7 @@ def extract_relations(input_dir: Path, output_file: Path) -> int:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Extract relation sheet (2nd sheet) from XLSX files into JSONL."
-    )
+    parser = argparse.ArgumentParser(description="Extract relation sheet (2nd sheet) from XLSX files into JSONL.")
     parser.add_argument(
         "--input-dir",
         default="test/data/mydata/doc",

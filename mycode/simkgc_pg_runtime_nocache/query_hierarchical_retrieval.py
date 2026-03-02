@@ -1,7 +1,6 @@
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, List
 
 # 运行示例：
 # python query_hierarchical_retrieval.py \
@@ -11,7 +10,8 @@ from typing import Dict, List
 #   --l0-collection simkgc_power_l0_full \
 #   --text-encoder sentence-transformers/all-MiniLM-L6-v2
 
-def build_query_embedding(text: str, encoder_name: str) -> List[float]:
+
+def build_query_embedding(text: str, encoder_name: str) -> list[float]:
     from sentence_transformers import SentenceTransformer
 
     model = SentenceTransformer(encoder_name)
@@ -27,7 +27,7 @@ def query_hierarchical(
     text_encoder: str,
     l1_topk: int,
     l0_topk_per_community: int,
-) -> Dict:
+) -> dict:
     import chromadb
 
     client = chromadb.PersistentClient(path=str(chroma_dir))
@@ -88,7 +88,7 @@ def query_hierarchical(
     }
 
 
-def pretty_print(result: Dict) -> None:
+def pretty_print(result: dict) -> None:
     print("=" * 88)
     print(f"Query: {result['query']}")
     print(f"L1 topk={result['l1_topk']}, L0 topk/community={result['l0_topk_per_community']}")
@@ -106,8 +106,7 @@ def pretty_print(result: Dict) -> None:
 
         for rank, hit in enumerate(matched[0]["hits"], start=1):
             print(
-                f"  - L0-{rank}: entity_id={hit['entity_id']}, "
-                f"entity={hit['entity']}, distance={hit['distance']:.6f}"
+                f"  - L0-{rank}: entity_id={hit['entity_id']}, entity={hit['entity']}, distance={hit['distance']:.6f}"
             )
 
 

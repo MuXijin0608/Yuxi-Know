@@ -4,8 +4,8 @@ from typing import Annotated
 from langchain.agents import create_agent
 
 from src.agents.common import BaseAgent, BaseContext, gen_tool_info, load_chat_model
-from src.agents.common.tools import get_buildin_tools
 from src.agents.common.middlewares import RuntimeConfigMiddleware
+from src.agents.common.tools import get_buildin_tools
 from src.services.mcp_service import get_tools_from_all_servers
 
 
@@ -13,6 +13,7 @@ def _get_your_agent_tool_options() -> list[dict]:
     allowed_names = {"agentic_rag_search"}
     tools = [tool for tool in get_buildin_tools() if tool.name in allowed_names]
     return gen_tool_info(tools)
+
 
 PROMPT = """你是一个面向意图感知检索的 Agent。
 当用户问题涉及知识检索时，必须优先调用工具 `agentic_rag_search`，不要直接调用 `simkgc_pg_search` 或其他检索工具。
