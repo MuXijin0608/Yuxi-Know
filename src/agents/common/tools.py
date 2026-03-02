@@ -1,7 +1,12 @@
 import asyncio
+import math
 import os
+import re
+import sys
 import traceback
 import uuid
+from collections import Counter
+from pathlib import Path
 from typing import Annotated, Any
 
 import requests
@@ -48,6 +53,11 @@ def calculator(a: float, b: float, operation: str) -> float:
     except Exception as e:
         logger.error(f"Calculator error: {e}")
         raise
+
+
+@tool(name_or_callable="my_custom_tool", description="示例自定义工具：返回格式化的问候语")
+def my_custom_tool(name: str, topic: str = "智能体") -> str:
+    return f"你好，{name}！这是你的自定义工具，当前主题是：{topic}。"
 
 
 @tool
@@ -168,6 +178,497 @@ class CommonKnowledgeRetriever(KnowledgeRetrieverModel):
 
     file_name: str = Field(description="限定文件名称，当操作类型为 'search' 时，可以指定文件名称，支持模糊匹配")
 
+
+
+class HybridRagSearchInput(BaseModel):
+    query_text: str = Field(description="检索关键词")
+    db_names: list[str] | None = Field(default=None, description="限定知识库名称列表，为空时检索全部知识库")
+    include_graph: bool = Field(default=False, description="是否附带知识图谱检索结果")
+
+
+@tool(
+    name_or_callable="hybrid_rag_search",
+    description="混合检索工具：复用系统内置RAG检索，并可选附带知识图谱结果。",
+    args_schema=HybridRagSearchInput,
+)
+async def hybrid_rag_search(
+    query_text: str,
+    db_names: list[str] | None = None,
+    include_graph: bool = False,
+) -> dict[str, Any]:
+    """最小混合检索实现：优先复用系统现有 RAG。"""
+    retrievers = knowledge_base.get_retrievers()
+
+    if db_names:
+        selected_db_ids = [db_id for db_id, info in retrievers.items() if info.get("name") in db_names]
+    else:
+        selected_db_ids = list(retrievers.keys())
+
+    kb_results: list[dict[str, Any]] = []
+    for db_id in selected_db_ids:
+        info = retrievers.get(db_id)
+        if not info:
+            continue
+
+        retriever = info.get("retriever")
+        if not callable(retriever):
+            continue
+
+        try:
+            if asyncio.iscoroutinefunction(retriever):
+                result = await retriever(query_text)
+            else:
+                result = retriever(query_text)
+            kb_results.append({"db_id": db_id, "db_name": info.get("name"), "result": result})
+        except Exception as e:
+            logger.warning(f"hybrid_rag_search retriever failed ({db_id}): {e}")
+
+    graph_results = None
+    if include_graph:
+        try:
+            graph_results = graph_base.query_node(query_text, hops=2, return_format="triples")
+        except Exception as e:
+            logger.warning(f"hybrid_rag_search graph query failed: {e}")
+            graph_results = {"error": str(e)}
+
+    return {
+        "query": query_text,
+        "knowledge_results": kb_results,
+        "graph_results": graph_results,
+    }
+
+
+def _bm25_tokenize(text: str) -> list[str]:
+    lower_text = (text or "").lower()
+    tokens = re.findall(r"[a-z0-9_]+|[\u4e00-\u9fff]", lower_text)
+    cjk_chars = re.findall(r"[\u4e00-\u9fff]", lower_text)
+    tokens.extend(cjk_chars[i] + cjk_chars[i + 1] for i in range(len(cjk_chars) - 1))
+    return tokens
+
+
+async def _collect_rag_chunks_for_bm25() -> list[dict[str, Any]]:
+    chunk_rows: list[dict[str, Any]] = []
+
+    for kb_instance in knowledge_base.kb_instances.values():
+        files_meta = getattr(kb_instance, "files_meta", {}) or {}
+
+        for file_id, file_meta in files_meta.items():
+            if file_meta.get("is_folder"):
+                continue
+
+            status = str(file_meta.get("status") or "").lower()
+            if status not in {"indexed", "done"}:
+                continue
+
+            db_id = file_meta.get("database_id")
+            if not db_id:
+                continue
+
+            try:
+                content_info = await knowledge_base.get_file_content(db_id, file_id)
+            except Exception as e:
+                logger.warning(f"BM25 get_file_content failed for file_id={file_id}: {e}")
+                continue
+
+            lines = content_info.get("lines") or []
+            if not isinstance(lines, list):
+                continue
+
+            for idx, line in enumerate(lines):
+                if not isinstance(line, dict):
+                    continue
+
+                content = str(line.get("content") or line.get("text") or "").strip()
+                if not content:
+                    continue
+
+                chunk_id = str(line.get("id") or line.get("chunk_id") or f"{file_id}:{idx}")
+                chunk_rows.append(
+                    {
+                        "db_id": db_id,
+                        "db_name": kb_instance.databases_meta.get(db_id, {}).get("name", ""),
+                        "file_id": file_id,
+                        "filename": file_meta.get("filename", ""),
+                        "chunk_id": chunk_id,
+                        "chunk_order_index": line.get("chunk_order_index", idx),
+                        "content": content,
+                    }
+                )
+
+    return chunk_rows
+
+
+async def _run_bm25_search_stub(query_text: str) -> dict[str, Any]:
+    chunks = await _collect_rag_chunks_for_bm25()
+    if not chunks:
+        return {
+            "ok": False,
+            "engine": "bm25",
+            "message": "未找到可检索的已切分数据（请确认知识库已完成索引）。",
+            "query": query_text,
+            "results": [],
+        }
+
+    query_tokens = _bm25_tokenize(query_text)
+    if not query_tokens:
+        return {
+            "ok": False,
+            "engine": "bm25",
+            "message": "查询词为空或无法分词。",
+            "query": query_text,
+            "results": [],
+        }
+
+    docs_tokens: list[list[str]] = []
+    docs_tf: list[Counter[str]] = []
+    doc_lens: list[int] = []
+    df: Counter[str] = Counter()
+
+    for row in chunks:
+        tokens = _bm25_tokenize(row["content"])
+        docs_tokens.append(tokens)
+        tf = Counter(tokens)
+        docs_tf.append(tf)
+        doc_lens.append(len(tokens))
+        for token in set(tokens):
+            df[token] += 1
+
+    n_docs = len(chunks)
+    avgdl = (sum(doc_lens) / n_docs) if n_docs else 1.0
+    k1 = 1.5
+    b = 0.75
+    query_tf = Counter(query_tokens)
+
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for idx, row in enumerate(chunks):
+        tf = docs_tf[idx]
+        dl = doc_lens[idx] or 1
+        score = 0.0
+        for token, qf in query_tf.items():
+            freq = tf.get(token, 0)
+            if freq == 0:
+                continue
+            token_df = df.get(token, 0)
+            idf = math.log(1 + (n_docs - token_df + 0.5) / (token_df + 0.5))
+            denom = freq + k1 * (1 - b + b * dl / avgdl)
+            score += qf * idf * ((freq * (k1 + 1)) / denom)
+
+        if score > 0:
+            scored.append((score, row))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    topk = 10
+    results = []
+    for score, row in scored[:topk]:
+        results.append(
+            {
+                "score": round(score, 6),
+                "db_id": row["db_id"],
+                "db_name": row["db_name"],
+                "file_id": row["file_id"],
+                "filename": row["filename"],
+                "chunk_id": row["chunk_id"],
+                "chunk_order_index": row["chunk_order_index"],
+                "content": row["content"],
+            }
+        )
+
+    return {
+        "ok": True,
+        "engine": "bm25",
+        "query": query_text,
+        "total_chunks": n_docs,
+        "matched_chunks": len(scored),
+        "results": results,
+    }
+
+
+class SimKGCPGSearchInput(BaseModel):
+    query_text: str = Field(description="检索查询文本")
+    chroma_dir: str = Field(default="chroma_db_full", description="Chroma 向量库目录")
+    l1_collection: str = Field(default="simkgc_power_l1_full", description="L1 集合名")
+    l0_collection: str = Field(default="simkgc_power_l0_full", description="L0 集合名")
+    text_encoder: str = Field(default="sentence-transformers/all-MiniLM-L6-v2", description="文本编码器模型")
+
+
+@tool(
+    name_or_callable="simkgc_pg_search",
+    description="调用本地 SimKGC-PG 分层检索脚本，返回检索输出。",
+    args_schema=SimKGCPGSearchInput,
+)
+async def simkgc_pg_search(
+    query_text: str,
+    chroma_dir: str = "chroma_db_full",
+    l1_collection: str = "simkgc_power_l1_full",
+    l0_collection: str = "simkgc_power_l0_full",
+    text_encoder: str = "sentence-transformers/all-MiniLM-L6-v2",
+) -> dict[str, Any]:
+    return await _run_simkgc_pg_search(
+        query_text=query_text,
+        chroma_dir=chroma_dir,
+        l1_collection=l1_collection,
+        l0_collection=l0_collection,
+        text_encoder=text_encoder,
+    )
+
+
+async def _run_simkgc_pg_search(
+    query_text: str,
+    chroma_dir: str = "chroma_db_full",
+    l1_collection: str = "simkgc_power_l1_full",
+    l0_collection: str = "simkgc_power_l0_full",
+    text_encoder: str = "sentence-transformers/all-MiniLM-L6-v2",
+) -> dict[str, Any]:
+    project_root = Path(__file__).resolve().parents[3]
+    script_dir = project_root / "scripts" / "simkgc_pg_runtime_nocache"
+    script_path = script_dir / "query_hierarchical_retrieval.py"
+
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        str(script_path),
+        "--query",
+        query_text,
+        "--chroma-dir",
+        chroma_dir,
+        "--l1-collection",
+        l1_collection,
+        "--l0-collection",
+        l0_collection,
+        "--text-encoder",
+        text_encoder,
+        cwd=str(script_dir),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await process.communicate()
+
+    return {
+        "ok": process.returncode == 0,
+        "returncode": process.returncode,
+        "stdout": stdout.decode("utf-8", errors="ignore"),
+        "stderr": stderr.decode("utf-8", errors="ignore"),
+    }
+
+
+async def _run_system_rag_search(
+    query_text: str,
+    db_names: list[str] | None = None,
+) -> dict[str, Any]:
+    retrievers = knowledge_base.get_retrievers()
+    if not retrievers:
+        return {
+            "ok": False,
+            "engine": "system_rag",
+            "query": query_text,
+            "message": "系统尚未注册任何知识库检索器。",
+            "results": [],
+            "errors": [],
+        }
+
+    if db_names:
+        target_names = {name.strip() for name in db_names if name and name.strip()}
+        selected_items = [
+            (db_id, info)
+            for db_id, info in retrievers.items()
+            if info.get("name") in target_names
+        ]
+    else:
+        selected_items = list(retrievers.items())
+
+    if not selected_items:
+        return {
+            "ok": False,
+            "engine": "system_rag",
+            "query": query_text,
+            "message": "未匹配到指定名称的知识库。",
+            "results": [],
+            "errors": [],
+        }
+
+    results: list[dict[str, Any]] = []
+    errors: list[str] = []
+
+    for db_id, info in selected_items:
+        retriever = info.get("retriever")
+        if not callable(retriever):
+            errors.append(f"知识库 {info.get('name', db_id)} 未提供 retriever 函数")
+            continue
+
+        try:
+            if asyncio.iscoroutinefunction(retriever):
+                payload = await retriever(query_text)
+            else:
+                payload = retriever(query_text)
+
+            results.append(
+                {
+                    "db_id": db_id,
+                    "db_name": info.get("name", ""),
+                    "metadata": info.get("metadata", {}),
+                    "result": payload,
+                }
+            )
+        except Exception as exc:  # pragma: no cover - runtime safeguard
+            error_msg = f"检索 {info.get('name', db_id)} 失败: {exc}"
+            logger.warning(error_msg)
+            errors.append(error_msg)
+
+    return {
+        "ok": bool(results),
+        "engine": "system_rag",
+        "query": query_text,
+        "results": results,
+        "errors": errors,
+        "selected_databases": [info.get("name", db_id) for db_id, info in selected_items],
+    }
+
+
+class AgenticRagSearchInput(BaseModel):
+    query_text: str = Field(description="用户查询")
+    route_hint: str | None = Field(
+        default=None,
+        description="可选路由提示：bm25 / simkgc / system / hybrid / all，或以 bm25+system 形式组合，不传则自动判定。",
+    )
+    simkgc_chroma_dir: str = Field(default="chroma_db_full", description="SimKGC Chroma 目录")
+    simkgc_l1_collection: str = Field(default="simkgc_power_l1_full", description="SimKGC L1 集合")
+    simkgc_l0_collection: str = Field(default="simkgc_power_l0_full", description="SimKGC L0 集合")
+    simkgc_text_encoder: str = Field(
+        default="sentence-transformers/all-MiniLM-L6-v2",
+        description="SimKGC 文本编码器",
+    )
+    system_db_names: list[str] | None = Field(
+        default=None,
+        description="限定系统 RAG 检索的知识库名称列表，默认检索全部知识库",
+    )
+
+
+def _decide_agentic_rag_route(query_text: str, route_hint: str | None = None) -> str:
+    valid_single = {"bm25", "simkgc", "system"}
+
+    def _canonicalize(raw: str | None) -> str | None:
+        if not raw:
+            return None
+        normalized = raw.strip().lower()
+        if not normalized:
+            return None
+        if normalized in {"hybrid", "all"} | valid_single:
+            return normalized
+
+        tokens = [token.strip() for token in normalized.replace(",", "+").split("+") if token.strip()]
+        if not tokens:
+            return None
+
+        canonical: list[str] = []
+        for token in tokens:
+            if token in valid_single and token not in canonical:
+                canonical.append(token)
+
+        if not canonical:
+            return None
+
+        if set(canonical) == {"bm25", "simkgc", "system"}:
+            return "all"
+        if set(canonical) == {"bm25", "simkgc"}:
+            return "hybrid"
+        return "+".join(canonical)
+
+    canonical_hint = _canonicalize(route_hint)
+    if canonical_hint:
+        return canonical_hint
+
+    text = (query_text or "").strip()
+    if not text:
+        return "all"
+
+    if len(text) <= 12:
+        return "bm25+system"
+
+    semantic_cues = ["如何", "怎么", "原因", "为什么", "机制", "导致", "影响", "诊断", "排查"]
+    if any(cue in text for cue in semantic_cues):
+        return "simkgc+system"
+
+    return "all"
+
+
+def _expand_route_to_engines(route: str) -> list[str]:
+    valid = ["bm25", "simkgc", "system"]
+    normalized = (route or "").strip().lower()
+
+    if normalized == "hybrid":
+        return ["bm25", "simkgc"]
+    if normalized == "all":
+        return valid
+
+    tokens = [token.strip() for token in normalized.replace(",", "+").split("+") if token.strip()]
+    selected: list[str] = []
+    for token in tokens:
+        if token in valid and token not in selected:
+            selected.append(token)
+
+    if not selected:
+        return ["system"]
+
+    return selected
+
+
+@tool(
+    name_or_callable="agentic_rag_search",
+    description=(
+        "Agentic RAG 路由工具：先做意图判定，再按状态机强制执行 bm25 / SimKGC / 系统 RAG，"
+        "可按单引擎或组合方式运行。状态跳转：analyze_intent -> route -> execute -> done。"
+    ),
+    args_schema=AgenticRagSearchInput,
+)
+async def agentic_rag_search(
+    query_text: str,
+    route_hint: str | None = None,
+    simkgc_chroma_dir: str = "chroma_db_full",
+    simkgc_l1_collection: str = "simkgc_power_l1_full",
+    simkgc_l0_collection: str = "simkgc_power_l0_full",
+    simkgc_text_encoder: str = "sentence-transformers/all-MiniLM-L6-v2",
+    system_db_names: list[str] | None = None,
+) -> dict[str, Any]:
+    state_path = ["analyze_intent"]
+    route = _decide_agentic_rag_route(query_text=query_text, route_hint=route_hint)
+    state_path.append(f"route:{route}")
+
+    engines = _expand_route_to_engines(route)
+    state_path.append(f"execute:{'+'.join(engines)}")
+
+    tasks: dict[str, asyncio.Task] = {}
+    if "bm25" in engines:
+        tasks["bm25"] = asyncio.create_task(_run_bm25_search_stub(query_text))
+    if "simkgc" in engines:
+        tasks["simkgc"] = asyncio.create_task(
+            _run_simkgc_pg_search(
+                query_text=query_text,
+                chroma_dir=simkgc_chroma_dir,
+                l1_collection=simkgc_l1_collection,
+                l0_collection=simkgc_l0_collection,
+                text_encoder=simkgc_text_encoder,
+            )
+        )
+    if "system" in engines:
+        tasks["system"] = asyncio.create_task(
+            _run_system_rag_search(query_text=query_text, db_names=system_db_names)
+        )
+
+    engine_results: dict[str, Any] = {"bm25": None, "simkgc": None, "system": None}
+    for name, task in tasks.items():
+        try:
+            engine_results[name] = await task
+        except Exception as exc:  # pragma: no cover - runtime safeguard
+            logger.error(f"agentic_rag_search {name} 执行失败: {exc}")
+            engine_results[name] = {"ok": False, "engine": name, "message": str(exc)}
+
+    state_path.append("done")
+    return {
+        "route": route,
+        "state_path": state_path,
+        "bm25": engine_results["bm25"],
+        "simkgc": engine_results["simkgc"],
+        "system": engine_results["system"],
+    }
 
 def get_kb_based_tools(db_names: list[str] | None = None) -> list:
     """获取所有知识库基于的工具"""
@@ -345,6 +846,10 @@ def get_buildin_tools() -> list:
     static_tools = [
         query_knowledge_graph,
         get_approved_user_goal,
+        my_custom_tool,
+        agentic_rag_search,
+        hybrid_rag_search,
+        simkgc_pg_search,
         calculator,
         text_to_img_demo,
     ]

@@ -1,0 +1,7 @@
+name = "Your Agent"
+description = "最小可运行智能体模板（LangGraph）。"
+examples = [
+    "你好，请介绍你的能力",
+    "请使用我配置的知识库回答问题",
+    "请尝试调用我启用的工具",
+]
